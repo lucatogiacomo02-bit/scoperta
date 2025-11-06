@@ -1,5 +1,7 @@
 # 🧭 Mobile Robot Simulation with CoppeliaSim and ROS 2
 
+Doc with SCOPERTA plan: [https://univr-my.sharepoint.com/:w:/g/personal/daniele_meli_univr_it/EQSUs2pW0eZAlAX_kmPSOt8BmGFLFFfHhOqrR6jWNNCb_w?e=K5cKhV]https://univr-my.sharepoint.com/:w:/g/personal/daniele_meli_univr_it/EQSUs2pW0eZAlAX_kmPSOt8BmGFLFFfHhOqrR6jWNNCb_w?e=K5cKhV
+
 This repository provides a **CoppeliaSim–ROS 2 integration workspace** for mobile robot simulation and control.  
 It includes both **low-level perception and control nodes** (e.g. LIDAR-based navigation) and **high-level logic** (e.g. finite state machine coordination).
 
