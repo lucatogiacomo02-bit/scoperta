@@ -44,6 +44,8 @@ class Turtlebot3HighLevelControl(Node):
 
         self.timer = self.create_timer(timer_period, self.control_loop)
 
+        self.ranges = None
+
 
     # loop each 0.1 seconds
     def control_loop(self):
