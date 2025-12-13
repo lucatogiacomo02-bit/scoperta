@@ -355,7 +355,7 @@ class LimoYoloNode(Node):
         self.stopped = False
         
         # Altrimenti avanza
-        speed = 0.4
+        forward_speed = 0.4
         # TODO
 
     # ----------------------------------------------------

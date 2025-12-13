@@ -205,7 +205,7 @@ class Turtlebot3SquarePath(Node):
                 continue
 
             error = normalize_angle(target_yaw - self.yaw)
-            if abs(error) < math.radians(1.5): # Tollernaza di 1.5 gradi
+            if abs(error) < math.radians(1.5): # Tolleranza di 1.5 gradi
                 break
 
             k = 1.2 # Guadagno Proporzionale (P)
