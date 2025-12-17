@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'yolo_obstacle_avoidance_pkg'
+package_name = 'finite_state_machine'
 
 setup(
     name=package_name,
@@ -24,7 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-        	'yolo_obstacle_avoidance_runner = 				yolo_obstacle_avoidance_pkg.yolo_obstacle_avoidance:main',
+        	'finite_state_machine_runner = finite_state_machine.finite_state_machine:main',
         ],
     },
 )

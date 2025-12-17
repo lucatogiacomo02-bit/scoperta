@@ -1,5 +1,13 @@
-'''
 #!/usr/bin/env python3
+"""
+Nodo ROS 2 per l'Evitamento Semplice di Ostacoli utilizzando un sensore LaserScan (LiDAR).
+
+Questo nodo si iscrive al topic /scan per ricevere i dati LiDAR,
+monitora la distanza minima in un'area frontale ristretta e,
+se viene rilevato un ostacolo vicino, determina la direzione più libera
+(sinistra o destra) in base alla scansione completa e ruota per evitarlo.
+Altrimenti, il robot avanza.
+"""
 import os
 os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
 
@@ -9,306 +17,11 @@ import numpy as np
 import rclpy                                        # type: ignore
 from rclpy.node import Node                         # type: ignore
 
-from sensor_msgs.msg import Image, LaserScan        # type: ignore
+from sensor_msgs.msg import LaserScan               # type: ignore
 from cv_bridge import CvBridge                      # type: ignore
 from geometry_msgs.msg import Twist                 # type: ignore
 
 from vision_msgs.msg import (                       # type: ignore
-    Detection2D,
-    Detection2DArray,
-    ObjectHypothesisWithPose,
-    BoundingBox2D
-)
-
-try:
-    from ultralytics import YOLO
-except ImportError:
-    YOLO = None
-
-
-class LimoYoloNode(Node):
-    def __init__(self):
-        super().__init__("limo_yolo")
-
-        # ----------------------------------------------------
-        # Parameters
-        # ----------------------------------------------------
-        self.declare_parameter("image_topic", "/image")
-        self.declare_parameter("model", "yolov8n.pt")
-        self.declare_parameter("score_thresh", 0.5)
-        self.declare_parameter("filter_class", "elephant")
-        self.declare_parameter("safe_distance", 0.4)
-
-        self.img_topic = self.get_parameter("image_topic").value
-        self.model_path = self.get_parameter("model").value
-        self.score_thresh = self.get_parameter("score_thresh").value
-        self.filter_class = self.get_parameter("filter_class").value.lower()
-        self.safe_distance = self.get_parameter("safe_distance").value
-
-        # ----------------------------------------------------
-        # Internal state vars
-        # ----------------------------------------------------
-        self.bridge = CvBridge()
-        self.model = None
-        self.model_names = {}
-        self.current_distance = None
-        self.last_detections = []
-        self.target_detected = False
-        self.target_confidence = 0.0
-        self.target_last_seen_time = time.time()
-
-        # control loop (20 Hz)
-        self.control_timer = self.create_timer(0.05, self.control_loop)
-
-        # ----------------------------------------------------
-        # ROS I/O
-        # ----------------------------------------------------
-        self.sub_image = self.create_subscription(
-            Image, self.img_topic, self.on_image, 10
-        )
-
-        self.sub_scan = self.create_subscription(
-            LaserScan, "/scan", self.on_scan, 10
-        )
-
-        self.pub_det = self.create_publisher(
-            Detection2DArray, "detections", 10
-        )
-
-        self.cmd_pub = self.create_publisher(
-            Twist, "/cmd_vel", 10
-        )
-
-        # Main behavior timer (runs at 20 Hz)
-        self.behavior_timer = self.create_timer(
-            0.05, self.run_state_machine
-        )
-
-        self.load_model()
-
-        self.get_logger().info(f"Limo YOLO node ready. Searching for {self.filter_class}")
-
-    # ----------------------------------------------------
-    # MODEL LOADING
-    # ----------------------------------------------------
-    def load_model(self):
-        if YOLO is None:
-            raise RuntimeError("Ultralytics not installed")
-
-        t0 = time.time()
-        self.model = YOLO(self.model_path)
-        self.model.fuse()
-        self.model_names = self.model.names
-        self.get_logger().info(f"Loaded YOLO model in {time.time()-t0:.2f}s")
-
-    # ----------------------------------------------------
-    # CAMERA CALLBACK
-    # ----------------------------------------------------
-    def on_image(self, msg: Image):
-        """Runs YOLO and stores latest detections."""
-        try:
-            img_bgr = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-        except Exception as e:
-            self.get_logger().warn(f"cv_bridge failed: {e}")
-            return
-
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-
-        results = self.model.predict(
-            img_rgb,
-            imgsz=320,
-            conf=self.score_thresh,
-            verbose=False
-        )
-
-        # Clear previous
-        self.last_detections = []
-
-        if not results:
-            return
-
-        r = results[0]
-        if r.boxes is None:
-            return
-
-        boxes = r.boxes
-        xyxy = boxes.xyxy.cpu().numpy()
-        conf = boxes.conf.cpu().numpy()
-        cls_ids = boxes.cls.cpu().numpy()
-
-        for i in range(len(xyxy)):
-            x1, y1, x2, y2 = xyxy[i]
-            score = conf[i]
-            cls_id = int(cls_ids[i])
-            cls_name = str(self.model_names.get(cls_id, cls_id)).lower()
-
-            if cls_name != self.filter_class:
-                continue
-
-            det = Detection2D()
-            det.bbox = BoundingBox2D()
-
-            det.bbox.center.position.x = float((x1 + x2) / 2)
-            det.bbox.center.position.y = float((y1 + y2) / 2)
-            det.bbox.size_x = float(x2 - x1)
-            det.bbox.size_y = float(y2 - y1)
-
-            hyp = ObjectHypothesisWithPose()
-            hyp.hypothesis.class_id = cls_name
-            hyp.hypothesis.score = float(score)
-            det.results.append(hyp)
-
-            self.last_detections.append(det)
-
-    # ----------------------------------------------------
-    # LIDAR CALLBACK
-    # ----------------------------------------------------
-    def on_scan(self, msg: LaserScan):
-        """Updates current forward distance."""
-        # min distance in front 30 degrees window
-        ranges = np.array(msg.ranges)
-        valid = ranges[~np.isnan(ranges)]
-        if len(valid) == 0:
-            self.current_distance = None
-        else:
-            self.current_distance = float(np.min(valid))
-
-    # ----------------------------------------------------
-    # BEHAVIOR STATE MACHINE
-    # ----------------------------------------------------
-    def run_state_machine(self):
-
-        if self.state == "SEARCH":
-            self.search_behavior()
-
-        elif self.state == "APPROACH":
-            self.approach_behavior()
-
-        elif self.state == "STOP":
-            self.publish_stop()
-
-    def control_loop(self):
-
-        now = time.time()
-
-        # If target lost, return to search mode
-        if now - self.target_last_seen_time > 0.3:  # 300 ms without detection
-            self.target_detected = False
-
-        # -----------------------------------------------------
-        # 2) If NO target → SEARCH MODE (spin)
-        # -----------------------------------------------------
-        if not self.target_detected:
-            self.publish_twist(0.0, 0.6)  # spin left
-            return
-
-        # -----------------------------------------------------
-        # 3) If target detected BUT no LIDAR yet
-        # -----------------------------------------------------
-        if self.current_distance is None:
-            self.publish_stop()
-            self.get_logger().info("Target found, waiting for LIDAR...")
-            return
-
-        # -----------------------------------------------------
-        # 4) If close enough → STOP
-        # -----------------------------------------------------
-        if self.current_distance <= self.safe_distance:
-            self.publish_stop()
-            return
-
-        # -----------------------------------------------------
-        # 5) APPROACH target
-        # -----------------------------------------------------
-        self.publish_twist(0.4, 0.0)
-
-
-    # ----------------------------------------------------
-    # SEARCH MODE
-    # ----------------------------------------------------
-    def search_behavior(self):
-        """Spin until target detected."""
-        # spin in place
-        self.publish_twist(0.0, 0.8)
-
-        for det in self.last_detections:
-            cls = det.results[0].hypothesis.class_id
-            score = det.results[0].hypothesis.score
-
-            self.get_logger().info(
-                f"Detected {cls} score={score:.2f}"
-            )
-
-            if score >= self.score_thresh:
-                self.get_logger().info("Target found → switching to APPROACH")
-                self.state = "APPROACH"
-                self.publish_stop()
-                return
-
-    # ----------------------------------------------------
-    # APPROACH MODE
-    # ----------------------------------------------------
-    def approach_behavior(self):
-        """Drive forward until safe distance reached."""
-        if self.current_distance is None:
-            self.get_logger().info("No LIDAR yet...")
-            return
-
-        if self.current_distance <= self.safe_distance:
-            self.get_logger().info("Close enough — stopping")
-            self.publish_stop()
-            self.state = "STOP"
-            return
-
-        # move forward slowly
-        self.publish_twist(0.5, 0.0)
-
-    # ----------------------------------------------------
-    # MOVEMENT HELPERS
-    # ----------------------------------------------------
-    def publish_twist(self, linear=0.0, angular=0.0):
-        msg = Twist()
-        msg.linear.x = float(linear)
-        msg.angular.z = float(angular)
-        self.cmd_pub.publish(msg)
-
-    def publish_stop(self):
-        self.publish_twist(0.0, 0.0)
-
-
-def main():
-    rclpy.init()
-    node = LimoYoloNode()
-
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.publish_stop()
-        node.destroy_node()
-        rclpy.shutdown()
-
-
-if __name__ == "__main__":
-    main()
-'''
-
-#!/usr/bin/env python3
-import os
-os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
-
-import time
-import cv2
-import numpy as np
-import rclpy
-from rclpy.node import Node
-
-from sensor_msgs.msg import LaserScan
-from cv_bridge import CvBridge
-from geometry_msgs.msg import Twist
-
-from vision_msgs.msg import (
     Detection2D,
     ObjectHypothesisWithPose,
     BoundingBox2D
@@ -316,14 +29,18 @@ from vision_msgs.msg import (
 
 
 class ObstacleAvoidanceNode(Node):
+    """
+    Nodo ROS 2 che implementa l'algoritmo di evitamento ostacoli
+    "Bug-like" basato sulla lettura del LaserScan (LiDAR).
+    """
     def __init__(self):
         super().__init__("obstacle_avoidance")
 
 
         # Internal state
-        self.current_distance = np.inf
+        self.current_distance = np.inf   # Distanza minima rilevata nel campo visivo frontale ristretto
         self.obstacle_detected = False
-        self.ranges = []
+        self.ranges = []                 # Array completo delle distanze dalla scansione LiDAR
  
         self.sub_scan = self.create_subscription(
             LaserScan, "/scan", self.on_scan, 10
@@ -345,24 +62,46 @@ class ObstacleAvoidanceNode(Node):
 
     # LIDAR callback
     def on_scan(self, msg: LaserScan):
-        # Get distances
+        """
+        Callback per la ricezione del messaggio LaserScan.
+
+        Aggiorna l'array completo delle distanze (`self.ranges`) e calcola
+        la distanza minima nel settore frontale di $\pm 30$ gradi.
+
+        Args:
+            msg (LaserScan): Messaggio ROS 2 contenente le letture del LiDAR.
+        """
+
+        # Ottiene le distanze
         ranges = np.array(msg.ranges)
 
-        # Update internal field
+        # Aggiorna campo interno
         self.ranges = ranges
 
-        # Reduce range to -30/+30 degrees only
+        # Considera un arco frontale -30/+30 gradi
         n = len(ranges)
         center = n // 2
-        window = ranges[center - 30 : center + 30]
+        
+        # Assume che il centro (center) sia 0 gradi (frontale)
+        window_size = 30 # gradi da ciascun lato del centro
+        
+        window = ranges[center - window_size : center + window_size] 
 
-        # Get the minimum distance in that range
+        # Ottiene la distanza minima nell'arco considerato
         self.current_distance = np.nanmin(window)
 
 
     def detect_obstacle(self, threshold_dist=0.4):
+        """
+        Verifica se la distanza minima frontale (`self.current_distance`)
+        è inferiore alla soglia specificata, aggiornando `self.obstacle_detected`.
+
+        Args:
+            threshold_dist (float): Soglia di distanza (in metri) per considerare
+                                    un ostacolo come rilevato.
+        """
         
-        # Check whether an obstacle is in front
+        # Controlla se il robot deve evitare un ostacolo
         if self.current_distance < threshold_dist:
             self.obstacle_detected = True
             return
@@ -372,48 +111,70 @@ class ObstacleAvoidanceNode(Node):
 
     # Control loop
     def control_loop(self):
+        """
+        Loop di controllo periodico che implementa la logica di navigazione.
+
+        1. Verifica la presenza di ostacoli frontali.
+        2. Se un ostacolo è rilevato:
+           a. Analizza la scansione completa per trovare la direzione più libera
+              (a sinistra o a destra) misurando la distanza minima su ciascun lato.
+           b. Ruota sul posto nella direzione più libera.
+        3. Se nessun ostacolo è rilevato, avanza.
+        """
 
         self.obstacle_detected = False
 
-        # Check for obstacle
+        # Controlla se vi sono ostacoli vicini
         self.detect_obstacle()
 
-        # If obstacle detected, turn 
+        # Se un ostacolo è stato rilevato: gira
         if self.obstacle_detected:
 
-            # Identify most free direction
+            # Identifica la direzione più libera
             n = len(self.ranges)
             center = n // 2
 
+            # Divide la scansione in metà sinistra e metà destra
             left_window = self.ranges[:center]
             right_window = self.ranges[center:]
 
-            left_min_distance = np.nanmin(left_window)      # min distance on the left half
-            right_min_distance = np.nanmin(right_window)    # min distance on the right half
+            left_min_distance = np.nanmin(left_window)      # Distanza min nella metà sinistra
+            right_min_distance = np.nanmin(right_window)    # Distanza min nella metà destra
 
+            # Scegli la direzione con la distanza minima maggiore (spazio più aperto)
             if left_min_distance > right_min_distance:
+                # Rotazione in senso antiorario (CCW) verso sinistra (direzione positiva in Z)
                 direction = 1   
             else:
+                # Rotazione in senso orario (CW) verso destra (direzione negativa in Z)
                 direction = -1
 
-            # Rotate to avoid obstacle
+            # Ruota
             self.publish_twist(0.0, 0.5 * direction)
 
             return
         
-        # If no object is detected, move forward
+        # Altrimenti, prosegue dritto
         self.publish_twist(0.8, 0)
 
             
 
-    # Movement helpers
+    # Metodi di supporto al movimento
     def publish_twist(self, linear=0.0, angular=0.0):
+        """
+        Pubblica un comando di velocità lineare e angolare sul topic /cmd_vel.
+
+        Args:
+            linear (float): Velocità lineare in X (m/s).
+            angular (float): Velocità angolare in Z (rad/s).
+        """
         msg = Twist()
         msg.linear.x = float(linear)
         msg.angular.z = float(angular)
         self.cmd_pub.publish(msg)
 
     def publish_stop(self):
+        """Pubblica un comando di velocità nullo (arresto del robot)."""
         self.publish_twist(0.0, 0.0)
 
 
@@ -421,6 +182,11 @@ class ObstacleAvoidanceNode(Node):
 # MAIN
 # ----------------------------------------------------
 def main():
+    """
+    Funzione principale per l'esecuzione del nodo.
+    Inizializza ROS 2, crea il nodo e avvia lo spin.
+    Garantisce l'arresto del robot al termine.
+    """
     rclpy.init()
     node = ObstacleAvoidanceNode()
 
@@ -429,7 +195,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        node.publish_stop()   # ensure motors stop
+        node.publish_stop()   # assicura l'arresto dei motori
         rclpy.shutdown()
         node.destroy_node()
 

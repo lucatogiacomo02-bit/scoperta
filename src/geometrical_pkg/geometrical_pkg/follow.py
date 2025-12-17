@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""
+Nodo ROS 2 per pilotare un robot mobile (ad esempio un TurtleBot3)
+per seguire percorsi predefiniti come un quadrato, un poligono o un cerchio,
+utilizzando il feedback di odometria.
+"""
 import rclpy                                                                # type: ignore
 from rclpy.node import Node                                                 # type: ignore
 import threading
@@ -11,28 +16,52 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy    # ty
 
 
 # -------------------------------------------------------------------
-# Utility functions
+# Funzioni di supporto
 # -------------------------------------------------------------------
 def quaternion_to_yaw(qx, qy, qz, qw):
-    """Compute yaw (rotation around Z) from quaternion."""
+    """
+    Calcola l'imbardata (rotazione attorno a Z) da un quaternione.
+
+    Args:
+        qx (float): Componente X del quaternione.
+        qy (float (float): Componente Y del quaternione.
+        qz (float): Componente Z del quaternione.
+        qw (float): Componente W del quaternione.
+
+    Returns:
+        float: Angolo di imbardata in radianti.
+    """
     siny_cosp = 2.0 * (qw * qz + qx * qy)
     cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
     return math.atan2(siny_cosp, cosy_cosp)
 
-
 def normalize_angle(angle):
-    """Normalize angle to [-pi, pi)."""
+    """
+    Normalizza un angolo all'intervallo [-pi, pi).
+
+    Args:
+        angle (float): L'angolo in radianti.
+
+    Returns:
+        float: L'angolo normalizzato in radianti.
+    """
     return (angle + math.pi) % (2 * math.pi) - math.pi
 
 
 # -------------------------------------------------------------------
-# Main node
+# Nodo ROS principale
 # -------------------------------------------------------------------
 class Turtlebot3SquarePath(Node):
+    """
+    Un nodo ROS 2 che controlla un TurtleBot3 per eseguire percorsi geometrici di base 
+    utilizzando l'odometria.
+
+    Gestisce l'abbonamento all'odometria e la pubblicazione dei comandi di velocità.
+    """
     def __init__(self):
         super().__init__('turtlebot3_square_path_node')
 
-        # QoS for odometry + velocity
+        # QoS per odometria e velocità
         qos = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -43,24 +72,29 @@ class Turtlebot3SquarePath(Node):
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', qos)
         self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, qos)
 
-        # Parameters
-        self.rate_hz           = 20.0
+        # Parametri
+        self.rate_hz = 20.0
 
-        # Odometry state
+        # Variabili di stato per odometria
         self.x = None
         self.y = None
         self.yaw = None
 
-        # Control flag
+        # Flag di controllo
         self.is_running = True
 
         self.get_logger().info('Node initialized.')
 
     # -------------------------------------------------------------------
-    # Callbacks and basic helpers
+    # Callbacks e metodi di supporto
     # -------------------------------------------------------------------
     def odom_callback(self, msg: Odometry):
-        """Extract odometry pose."""
+        """
+        Estrazione della posa di odometria (x, y, yaw) dal messaggio Odometry.
+
+        Args:
+            msg (Odometry): Messaggio di odometria ROS 2.
+        """
         self.x = msg.pose.pose.position.x
         self.y = msg.pose.pose.position.y
 
@@ -68,16 +102,32 @@ class Turtlebot3SquarePath(Node):
         self.yaw = quaternion_to_yaw(q.x, q.y, q.z, q.w)
 
     def publish_twist(self, linear=0.0, angular=0.0):
+        """
+        Pubblica un comando di velocità lineare e angolare sul topic /cmd_vel.
+
+        Args:
+            linear (float): Velocità lineare in X (m/s).
+            angular (float): Velocità angolare in Z (rad/s).
+        """
         t = Twist()
         t.linear.x = float(linear)
         t.angular.z = float(angular)
         self.cmd_pub.publish(t)
 
     def publish_stop(self):
+        """Pubblica un comando di velocità nullo (arresto del robot)."""
         self.publish_twist(0.0, 0.0)
 
     def wait_for_odom(self, timeout=5.0):
-        """Wait until x, y, yaw are received."""
+        """
+        Attende fino a quando non vengono ricevute le prime coordinate di odometria (x, y, yaw).
+
+        Args:
+            timeout (float): Tempo massimo di attesa in secondi.
+
+        Returns:
+            bool: True se l'odometria è stata ricevuta, False altrimenti.
+        """
         start = time.time()
         while rclpy.ok() and (self.x is None or self.yaw is None):
             if time.time() - start > timeout:
@@ -86,10 +136,18 @@ class Turtlebot3SquarePath(Node):
         return True
 
     # -------------------------------------------------------------------
-    # Motion primitives
+    # Primitive di movimento
     # -------------------------------------------------------------------
     def move_distance(self, distance, linear_vel):
-        """Move forward by given distance using odometry."""
+        """
+        Avanza o retrocede per una data distanza utilizzando l'odometria per il feedback.
+
+        Il movimento si interrompe quando la distanza target è stata coperta.
+
+        Args:
+            distance (float): Distanza da percorrere (m). Positivo per avanti, negativo per indietro.
+            linear_vel (float): Velocità lineare massima (m/s).
+        """
         if not self.wait_for_odom():
             self.get_logger().warn('No odom — aborting move_distance().')
             return
@@ -110,6 +168,7 @@ class Turtlebot3SquarePath(Node):
                 break
 
             remaining = max(target - traveled, 0.0)
+            # Controllo proporzionale per decelerare alla fine
             speed = min(linear_vel, remaining * 1.0 + 0.05)
 
             self.publish_twist(linear=direction * speed)
@@ -119,7 +178,16 @@ class Turtlebot3SquarePath(Node):
         time.sleep(0.05)
 
     def rotate_angle(self, angle_rad, angular_vel):
-        """Rotate by angle_rad (rad) using odometry yaw feedback."""
+        """
+        Ruota di un angolo specificato (rad) utilizzando il feedback di imbardata (yaw)
+        dell'odometria.
+
+        La rotazione si interrompe quando l'angolo target è raggiunto.
+
+        Args:
+            angle_rad (float): Angolo di rotazione in radianti. Positivo per CCW.
+            angular_vel (float): Velocità angolare massima (rad/s).
+        """
         if not self.wait_for_odom():
             self.get_logger().warn('No odom — aborting rotate_angle().')
             return
@@ -137,10 +205,10 @@ class Turtlebot3SquarePath(Node):
                 continue
 
             error = normalize_angle(target_yaw - self.yaw)
-            if abs(error) < math.radians(1.5):
+            if abs(error) < math.radians(1.5): # Tollernaza di 1.5 gradi
                 break
 
-            k = 1.2
+            k = 1.2 # Guadagno Proporzionale (P)
             angular_speed = min(angular_vel, max(0.05, abs(k * error)))
 
             self.publish_twist(angular=direction * angular_speed)
@@ -153,7 +221,17 @@ class Turtlebot3SquarePath(Node):
     # High-level trajectories
     # -------------------------------------------------------------------
     def run_square_path(self, side_length, duration, per_rot_duration=0.3):
-        """Execute a 4-sided square path."""
+        """
+        Esegue un percorso quadrato con 4 lati.
+
+        La velocità lineare e angolare sono calcolate in base alla durata totale.
+
+        Args:
+            side_length (float): Lunghezza di un lato del quadrato (m).
+            duration (float): Durata totale desiderata del percorso (s).
+            per_rot_duration (float): Frazione della durata totale dedicata alla rotazione
+                                      (e.g., 0.3 significa 30% del tempo totale).
+        """
         if not self.wait_for_odom(timeout=10.0):
             self.get_logger().error('No odom received — cannot start square.')
             return
@@ -161,16 +239,16 @@ class Turtlebot3SquarePath(Node):
         self.get_logger().info('Starting square path.')
 
         n_sides = 4
-        angle = math.pi / 2
+        angle = math.pi / 2 # 90 gradi
 
-        # Time allocation
+        # Allocazione del tempo
         total_rot_time = per_rot_duration * duration
-        total_straight_time = duration - per_rot_duration
+        total_straight_time = duration - total_rot_time
 
         rot_time = total_rot_time / n_sides
         straight_time = total_straight_time / n_sides
 
-        # Velocities
+        # Calcolo delle velocità
         linear_vel = side_length / straight_time
         angular_vel = angle / rot_time
 
@@ -188,20 +266,33 @@ class Turtlebot3SquarePath(Node):
         self.get_logger().info('Completed square path.')
 
     def follow_polygon(self, n_edges, side_length, duration, per_rot_duration=0.3):
+        """
+        Esegue un percorso poligonale di n lati.
+
+        La velocità lineare e angolare sono calcolate in base alla durata totale.
+
+        Args:
+            n_edges (int): Numero di lati del poligono.
+            side_length (float): Lunghezza di un lato del poligono (m).
+            duration (float): Durata totale desiderata del percorso (s).
+            per_rot_duration (float): Frazione della durata totale dedicata alla rotazione.
+        """
         if not self.wait_for_odom(timeout=10.0):
             self.get_logger().error('No odom — cannot start polygon.')
             return
 
         self.get_logger().info(f'Starting polygon with {n_edges} edges.')
 
+        # Allocazione del tempo
         total_rot_time = per_rot_duration * duration
-        total_straight_time = duration - per_rot_duration
+        total_straight_time = duration - total_rot_time
 
         rot_time = total_rot_time / n_edges
         straight_time = total_straight_time / n_edges
 
         external_angle = 2.0 * math.pi / n_edges
 
+        # Calcolo delle velocità
         linear_vel = side_length / straight_time
         angular_vel = external_angle / rot_time
 
@@ -213,14 +304,24 @@ class Turtlebot3SquarePath(Node):
             self.rotate_angle(external_angle, angular_vel)
 
         self.publish_stop()
+        self.get_logger().info('Completed polygon path.')
 
     def follow_circle(self, radius, duration):
+        """
+        Esegue un percorso circolare a velocità costante (velocità lineare/angolare)
+        per una data durata.
+
+        Args:
+            radius (float): Raggio del cerchio (m).
+            duration (float): Durata totale del percorso (s).
+        """
         if not self.wait_for_odom(timeout=10.0):
             self.get_logger().error('No odom — cannot start circle.')
             return
 
         self.get_logger().info(f'Starting circular path: radius={radius} m, duration={duration}s')
 
+        # Calcola le velocità per completare un giro in 'duration' secondi.
         linear_vel = 2.0 * math.pi * radius / duration
         angular_vel = 2.0 * math.pi / duration
 
@@ -242,6 +343,11 @@ class Turtlebot3SquarePath(Node):
 # Main entry
 # -------------------------------------------------------------------
 def main(args=None):
+    """
+    Funzione principale per l'esecuzione del nodo.
+    Inizializza ROS 2, crea il nodo, esegue lo spin in un thread
+    separato ed esegue la traiettoria desiderata.
+    """
     rclpy.init(args=args)
     node = Turtlebot3SquarePath()
 
@@ -267,4 +373,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
