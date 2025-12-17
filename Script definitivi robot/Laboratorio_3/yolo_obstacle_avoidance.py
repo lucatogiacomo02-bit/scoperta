@@ -9,7 +9,7 @@ Questo nodo combina tre compiti:
 3. Tracciamento/Interazione con Oggetto (YOLO + Depth): Rileva un oggetto target
    e si ferma ad una distanza di sicurezza da esso.
 
-Il nodo utilizza un loop di controllo a stati per gestire la sequenza di movimento
+Il nodo utilizza un loop di controllo per gestire la sequenza di movimento
 (normale, evitando ostacoli, o riallineamento).
 """
 import os
@@ -17,8 +17,8 @@ os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
 
 import time
 import math
-import cv2
-import numpy as np
+import cv2                                                                       # type: ignore
+import numpy as np                                                               # type: ignore
 import rclpy                                                                     # type: ignore
 from rclpy.node import Node                                                      # type: ignore
 from sensor_msgs.msg import Image, LaserScan                                     # type: ignore
@@ -28,7 +28,7 @@ from cv_bridge import CvBridge                                                  
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy         # type: ignore
 
 try:
-    from ultralytics import YOLO
+    from ultralytics import YOLO                                                 # type: ignore
 except ImportError:
     YOLO = None
 
@@ -41,8 +41,7 @@ class YoloObstacleAvoidanceNode(Node):
         super().__init__("limo_yolo")
 
         # -----------------------------
-        # 1. DICHIARAZIONE PARAMETRI
-        # (Imposta i valori di default e li rende accessibili esternamente)
+        # Dichiarazione parametri
         # -----------------------------
         self.declare_parameter("image_topic", "/image")
         self.declare_parameter("model", "yolov8n.pt")
@@ -61,8 +60,7 @@ class YoloObstacleAvoidanceNode(Node):
         self.declare_parameter("safe_distance", 0.4)      # Distanza Depth sotto cui il target è "raggiunto"
 
         # -----------------------------
-        # 2. CARICAMENTO PARAMETRI
-        # (Legge i valori definitivi, che possono essere i default o quelli esterni)
+        # Caricamento parametri
         # -----------------------------
         self.img_topic = self.get_parameter("image_topic").value
         self.model_path = self.get_parameter("model").value
@@ -93,24 +91,21 @@ class YoloObstacleAvoidanceNode(Node):
         self.bridge = CvBridge()
         self.model = None
         self.model_names = {}
-        self.target_detected = False        # Flag: Target YOLO rilevato
-        self.target_confidence = 0.0        # Confidenza del target YOLO
-        self.target_last_seen_time = time.time() # Ultimo istante in cui è stato visto il target
-        self.target_cx = 0                  # Centro X del box target (per profondità)
-        self.target_cy = 0                  # Centro Y del box target (per profondità)
+        self.target_detected = False                # Flag: Target YOLO rilevato
+        self.target_confidence = 0.0                # Confidenza del target YOLO
+        self.target_last_seen_time = time.time()    # Ultimo istante in cui è stato visto il target
+        self.target_cx = 0                          # Centro X del box target (per profondità)
+        self.target_cy = 0                          # Centro Y del box target (per profondità)
 
         self.current_distance = np.inf      # Distanza minima LiDAR frontale
         self.ranges = []                    # Array completo delle distanze LiDAR
 
         # Evitamento ostacoli
         self.obstacle_detected = False      # Flag: Ostacolo rilevato da LiDAR
-        self.avoiding = False               # Stato: Evitamento attivo (movimento laterale)
-        self.aligning = False               # Stato: Riallineamento verso il goal
+        self.avoiding = False               # Evitamento attivo (movimento laterale)
+        self.aligning = False               # Riallineamento verso il goal
         self.start_avoiding_x = None        # Posizione X all'inizio dell'evitamento
         self.start_avoiding_y = None        # Posizione Y all'inizio dell'evitamento
-
-        # Camera depth
-        self.latest_depth = None            # Ultimo frame di profondità
 
         # Logica di stop
         self.stop = False                   # Flag: Interrompe l'intera navigazione
@@ -129,7 +124,6 @@ class YoloObstacleAvoidanceNode(Node):
         self.sub_image = self.create_subscription(Image, self.img_topic, self.on_image, 10)             # Riceve immagini dalla camera
         self.sub_scan = self.create_subscription(LaserScan, "/scan", self.on_scan, 10)                  # Riceve il LIDAR
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)                                     # Invia velocità
-        self.sub_depth = self.create_subscription(Image, "/camera/depth/image_raw", self.on_depth, 10)  # Riceve profondità di camera
         self.pub_image = self.create_publisher(Image, "/yolo/annotated_image", 10)                      # Pubblica immagini annotate
 
 
@@ -209,8 +203,8 @@ class YoloObstacleAvoidanceNode(Node):
             conf=self.score_thresh,
             verbose=False
         )
-        # ... (Logica di estrazione e disegno dei box) ...
 
+        # Logica di estrazione e disegno dei box
         if not results:
             return
 
@@ -231,9 +225,7 @@ class YoloObstacleAvoidanceNode(Node):
             threshold_score=self.score_thresh
         )
 
-        # -------------------------------------------------------
         # Sovrappone all'immagine la bounding box se il bersaglio è stato individuato
-        # -------------------------------------------------------
         if self.target_detected:
 
             x = int(self.target_cx)
@@ -247,7 +239,7 @@ class YoloObstacleAvoidanceNode(Node):
                 if cls_name == self.filter_class:
                     x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
 
-                    # Draw rectangle
+                    # Traccia il contorno della box
                     cv2.rectangle(
                         img_bgr,
                         (x1, y1),
@@ -256,7 +248,7 @@ class YoloObstacleAvoidanceNode(Node):
                         2
                     )
 
-                    # Draw center point
+                    # Traccia il centro della box
                     cv2.circle(
                         img_bgr,
                         (self.target_cx, self.target_cy),
@@ -265,7 +257,7 @@ class YoloObstacleAvoidanceNode(Node):
                         -1
                     )
 
-                    # Draw label
+                    # Aggiunge l'etichetta della classe e la soglia di confidenza
                     label = f"{self.filter_class} {self.target_confidence:.2f}"
                     cv2.putText(
                         img_bgr,
@@ -279,9 +271,7 @@ class YoloObstacleAvoidanceNode(Node):
 
                     break
 
-            # -------------------------------------------------------
-            # Pubblica l'immagine annotata
-            # -------------------------------------------------------
+            # Pubblica l'immagine annotata sul topic d'uscita
             out_msg = self.bridge.cv2_to_imgmsg(img_bgr, encoding="bgr8")
             self.pub_image.publish(out_msg)
 
@@ -300,26 +290,8 @@ class YoloObstacleAvoidanceNode(Node):
             msg (LaserScan): Messaggio ROS 2 contenente le letture del LiDAR.
         """
         self.ranges = np.array(msg.ranges)
-
         # Calcola la distanza minima nel settore frontale (+/- 30 indici)
-        min_distance = None     # TODO
-        self.current_distance = min_distance
-
-    # -----------------------------
-    # CALLBACK PER CAMERA DEPTH 
-    # -----------------------------
-    def on_depth(self, msg: Image):
-        """
-        Callback per la ricezione delle immagini di profondità.
-        Memorizza l'array numpy della profondità.
-
-        Args:
-            msg (Image): Messaggio immagine ROS 2 (codifica 'passthrough').
-        """
-        try:
-            self.latest_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
-        except Exception as e:
-            self.get_logger().warning(f"Depth cv_bridge failed: {e}")
+        self.current_distance = np.nanmin(self.ranges[len(self.ranges)//2 - 30 : len(self.ranges)//2 + 30])
 
     # -----------------------------
     # CONTROL HELPERS
@@ -383,29 +355,18 @@ class YoloObstacleAvoidanceNode(Node):
 
         Prioritizza l'evitamento: un ostacolo è rilevato se la distanza LiDAR
         frontale è inferiore alla soglia, A MENO CHE l'oggetto rilevato da YOLO
-        sia proprio in quel punto (presumendo che sia il nostro target e non
-        vogliamo evitarlo in modo aggressivo, ma fermarci).
+        sia proprio in quel punto.
         """
 
-        # Se il target YOLO è rilevato E abbiamo il depth frame, e le due distanze (LiDAR frontale e Depth target)
-        # sono molto vicine, assumiamo che l'ostacolo sia il target, che non va evitato.
-        if self.target_detected and self.latest_depth is not None:
-
-            # Estrae la profondità (in metri) nel centro del box target
-            target_dist_depth = self.latest_depth[self.target_cy, self.target_cx]
-            
-            # Se la distanza LiDAR frontale è vicina alla distanza Depth del target,
-            # consideriamo il target come l'ostacolo.
-            if abs(self.current_distance - target_dist_depth) < 0.05:
-                self.obstacle_detected = False
-                return
+        # Se il target è stato identificato, non è segnalato come ostacolo (self.obstacle_detected = False).
+        # TODO
  
         # Rileva un ostacolo generico se la distanza LiDAR frontale è troppo piccola.
         self.obstacle_detected = None   # TODO
 
-        # Se è appena scattato l'evitamento, registra il punto di partenza.
+        # Se è appena scattato l'evitamento, registra il punto di partenza (usando la posizione corrente).
         if self.obstacle_detected and self.start_avoiding_x is None:
-            self.start_avoiding_x = None    # TODO
+            self.start_avoiding_x = None    # TODO  
             self.start_avoiding_y = None    # TODO
 
 
@@ -433,27 +394,28 @@ class YoloObstacleAvoidanceNode(Node):
         for i in range(len(xyxy)):
             x1, y1, x2, y2 = xyxy[i]
 
-            # Estrarre la confidenza 
+            # Calcola la confidenza della predizione corrente
             score = None    # TODO
 
-            # Estrarre la classe
+            # Calcola la classe corrente
             cls_idx = None  # TODO
             cls_name = str(self.model_names.get(int(cls_idx), "unknown")).lower()
 
+            # Debug: stampa la classe identificata
             # self.get_logger().info(f"Detected: {cls_name} (score={score:.2f})")
 
-            
-            # TODO: se classe e confidenza sono corrette, il target è stato trovato
+            # Prosegue solo se la classe corrente è la classe target e la confidenza è sufficientemente alta
+            # TODO
 
-
+            # IL target è stato localizzato
             self.target_confidence = None   # TODO
             self.target_last_seen_time = time.time()
 
-            # Aggiorna il centro del target per il prelievo della profondità
+            # Aggiorna il centro del target
             self.target_cx = None   # TODO
             self.target_cy = None   # TODO
 
-            self.target_detected = True
+            self.target_detected = None    # TODO
 
             return  
 
@@ -477,81 +439,74 @@ class YoloObstacleAvoidanceNode(Node):
         if self.stop:
             self.publish_stop()
             return
-        
-        # Controllo di arrivo (solo se il target YOLO è stato rilevato e la profondità è nota)
-        if self.latest_depth is not None and self.target_detected:
-            # Estrae la profondità (in metri) nel centro del box target
-            dist = self.latest_depth[self.target_cy, self.target_cx]
+            
+        # Controllo di arrivo 
+        if self.target_detected:
 
-            if dist < self.safe_distance and dist > 0.0:
-                
-                # TODO: fermare il robot
+            # TODO: se la distanza corrente è minore della distanza di sicurezza:
+            # a. pubblicare il comando di stop per il robot
+            # b. impostare correttamente la flag self.stop
+            # c. ritornare
 
-                self.stop = True
-                self.get_logger().info(f"Target reached ({dist:.2f}m). Task completed. Stopping...")
-                return
+            pass    # TODO               
             
         # Rileva ostacoli
         # TODO
 
         # EVITAMENTO (Ruota per liberare il fronte)
         if self.obstacle_detected:
-            
-            # TODO: individuare la direzione maggiormente libera
-            
-            # Scegli la direzione con lo spazio minimo maggiore
+
+            # TODO: scegli la direzione di rotazione come la direzione più libera (destra o sinistra)
             direction = None    # TODO
             
             # Ruota sul posto.
             self.publish_twist(0.0, 0.5 * direction)
             self.avoiding = True
             self.aligning = False 
+
             return
 
         # MOVIMENTO LATERALE (Avanza per allontanarsi dall'ostacolo)
-        # Esegue questo stato solo DOPO che l'evitamento è scattato (self.avoiding=True)
-        # e solo se il fronte è nuovamente libero (self.obstacle_detected=False).
         if self.avoiding:
 
-            # Calcola la distanza dal punto di partenza di evitamento
+            # Calcola la distanza dal punto di inizio evitamento
             dist = None     # TODO
 
-            if dist > self.rejoin_distance:
+            if None:    # TODO: controlla se la distanza è maggiore della distanza-soglia prefissata
                 # Distanza di sfollamento laterale raggiunta -> Passa al riallineamento
                 self.avoiding = False
                 self.start_avoiding_x = self.start_avoiding_y = None
                 self.aligning = True
             else:
-                # Continua ad avanzare lateralmente (non ruota in questo stato)
+                # Continua ad avanzare 
                 pass    # TODO
-
             return
 
         # RIALLINEAMENTO (Orientamento verso la direzione del goal)
         if self.aligning:
-
-            # Calcolare l'orientamento target
+            # Calcola l'orientamento target (l'orientamento della posizione di goal)
             target_yaw = None   # TODO
 
-            # Calcolare l'errore rispetto all'orientamento target
+            # Calcola l'errore angolare rispetto a target_yaw
             angle_err = None    # TODO
-            
-            if abs(angle_err) > self.align_tol:
 
+            # Se l'errore è tollerabile, smette di ruotare e avanza. Altrimenti continua a ruotare
+            if None:    # TODO
                 # Ruota con controllo proporzionale
                 angular_vel = max(min(0.8 * angle_err, self.turn_speed_max), -self.turn_speed_max)
-                
-                # TODO
+
+                # TODO: ruota
             else:
                 # Allineato -> Passa alla navigazione normale
-                
-                # TODO: avanza
 
+                # TODO: avanza
                 self.aligning = False
             return
         
         # NAVIGAZIONE NORMALE/AVANZAMENTO
-        # TODO: avanza
+        # TODO: avanza normalmente
+
+        return
 
 
 # -----------------------------

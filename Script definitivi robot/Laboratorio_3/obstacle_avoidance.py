@@ -12,8 +12,8 @@ import os
 os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
 
 import time
-import cv2
-import numpy as np
+import cv2                                          # type: ignore
+import numpy as np                                  # type: ignore
 import rclpy                                        # type: ignore
 from rclpy.node import Node                         # type: ignore
 
@@ -79,7 +79,7 @@ class ObstacleAvoidanceNode(Node):
         self.ranges = ranges
 
 
-        # TODO: considerando un arco frontale di -30/+30 gradi, estrarre la distanza minima presente in tale intervallo
+        # TODO: considerando un arco frontale di -30/+30 indici, estrarre la distanza minima presente in tale intervallo
         min_distance = None # TODO
 
 
@@ -138,7 +138,7 @@ class ObstacleAvoidanceNode(Node):
             return
         
         # Altrimenti, prosegue dritto
-        self.publish_twist(0.8, 0)
+        self.publish_twist(0.4, 0)
 
             
 

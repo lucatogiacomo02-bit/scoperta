@@ -12,8 +12,8 @@ import os
 os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
 
 import time
-import cv2
-import numpy as np
+import cv2                                 # type: ignore
+import numpy as np                         # type: ignore
 import rclpy                               # type: ignore
 from rclpy.node import Node                # type: ignore
             
@@ -28,7 +28,7 @@ from vision_msgs.msg import (              # type: ignore
 )
 
 try:
-    from ultralytics import YOLO
+    from ultralytics import YOLO           # type: ignore
 except ImportError:
     YOLO = None
 
@@ -38,8 +38,8 @@ class LimoYoloNode(Node):
     Nodo principale ROS 2 per l'elaborazione delle immagini e il controllo
     del movimento basato sulle rilevazioni YOLO.
 
-    Gestisce l'inferenza YOLO, l'estrazione della profondità per l'oggetto
-    rilevato e il loop di controllo per il tracciamento e l'arresto di sicurezza.
+    Gestisce l'inferenza YOLO e il loop di controllo 
+    per il tracciamento e l'arresto di sicurezza.
     """
     def __init__(self):
         super().__init__("limo_yolo")
@@ -49,59 +49,64 @@ class LimoYoloNode(Node):
         # ----------------------------------------------------
         self.declare_parameter("image_topic", "/image")
         self.declare_parameter("model", "yolov8n.pt")
-        self.declare_parameter("score_thresh", 0.5)             # Soglia di confidenza minima per non scartare una predizione
-        self.declare_parameter("filter_class", "elephant")      # Classe target da individuare
-        self.declare_parameter("safe_distance", 1.0)            # Distanza di sicurezza a cui fermarsi rispetto al target
+        self.declare_parameter("score_thresh", 0.5)               # Soglia di confidenza minima per non scartare una predizione
+        self.declare_parameter("filter_class", "sports ball")     # Classe target da individuare: può essere cambiata a "elephant" (# TODO)
+        self.declare_parameter("bb_ratio_threshold", 0.03)        # Rapporto tra area della bounding box e area dell'immagine necessario al robot per fermarsi
+        self.declare_parameter("turn_speed_max", 1.5)             # Velocità di rotazione massima
 
         self.img_topic = self.get_parameter("image_topic").value
         self.model_path = self.get_parameter("model").value
         self.score_thresh = self.get_parameter("score_thresh").value
         self.filter_class = self.get_parameter("filter_class").value.lower()
-        self.safe_distance = self.get_parameter("safe_distance").value
+        self.bb_ratio_threshold = self.get_parameter("bb_ratio_threshold").value
+        self.turn_speed_max = self.get_parameter("turn_speed_max").value
 
         # ----------------------------------------------------
         # Variabili di stato
         # ----------------------------------------------------
+
+        # PERCEZIONE E AI (YOLO & CV)
         self.bridge = CvBridge()
-        self.model = None
-        self.model_names = {}
+        self.model = None               # Modello YOLOv8 caricato in load_model()
+        self.model_names = {}           # Dizionario ID -> Nome Classe (es. 0: 'person')
+        
+        # GEOMETRIA IMMAGINE (Dimensioni sensore)
+        self.image_w = None             # Larghezza immagine (px) 
+        self.image_h = None             # Altezza immagine (px) 
 
-        self.last_detections = []
+        # STATO DEL TARGET (Tracking)
+        self.target_detected = False    # Flag principale: il target è attualmente visibile?
+        self.target_confidence = 0.0    # Confidenza (0.0 - 1.0) dell'ultima rilevazione
+        self.target_last_seen_time = time.time() # Timestamp per gestire il timeout (target perso)
+        
+        # Variabili di posizione (calcolate in detect_target)
+        self.target_cx = 0              # Coordinata X del centro del box (pixel)
+        self.target_cy = 0              # Coordinata Y del centro del box (pixel)
+        self.target_box_ratio = 0.0     # Area occupata dal box rispetto all'immagine (0.0 - 1.0)
 
-        self.target_detected = False
-        self.target_confidence = 0.0
-        self.target_last_seen_time = time.time()
-        self.stopped = False   
-
-        self.latest_depth = None
-
-
-        # Variabili per il tracciamento (calcolate in detect_target)
-        self.target_cx = 0      # Centro x (colonna) del bounding box target
-        self.target_cy = 0      # Centro y (riga) del bounding box target
+        # LOGICA DI CONTROLLO E SICUREZZA
+        self.stopped = False            # Stato di blocco (dopo aver raggiunto l'obiettivo)
+        
+        # Parametri per il centraggio 
+        # La "deadband" evita che il robot oscilli continuamente a destra e sinistra
+        self.center_deadband_ratio = 0.1 # Tolleranza centrale (10% della larghezza immagine)
+        self.target_centered = False    # True se il target è dentro la zona centrale
+        self.center_turn_speed = 0.4    # Velocità angolare di rotazione (rad/s)
 
         # ----------------------------------------------------
         # ROS I/O
         # ----------------------------------------------------
-        self.sub_image = self.create_subscription(
-            Image, self.img_topic, self.on_image, 10
+        self.sub_image = self.create_subscription(      
+            Image, self.img_topic, self.on_image, 10            # Riceve le immagini dalla camera del robot
         )
 
         self.cmd_pub = self.create_publisher(
-            Twist, "/cmd_vel", 10
+            Twist, "/cmd_vel", 10                               # Invia comandi di velocità al robot
         )
 
-        self.sub_depth = self.create_subscription(
-            Image,
-            "/camera/depth/image_raw",
-            self.on_depth,
-            10
-        )
-
-        # Per pubblicare immagini con bounding box sovrapposta 
         self.pub_image = self.create_publisher(
             Image,
-            "/yolo/annotated_image",
+            "/yolo/annotated_image",                            # Pubblica le immagini con bounding box sovrapposta
             10
         )
 
@@ -165,6 +170,10 @@ class LimoYoloNode(Node):
             return
 
         h, w = img_bgr.shape[:2]
+
+        if self.image_w is None:
+            self.image_w = w
+
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
         # Run YOLO inference
@@ -246,20 +255,6 @@ class LimoYoloNode(Node):
             self.pub_image.publish(out_msg)
 
 
-    def on_depth(self, msg: Image):
-        """
-        Callback per la ricezione delle immagini di profondità.
-        Memorizza l'array numpy della profondità.
-
-        Args:
-            msg (Image): Messaggio immagine ROS 2 (codifica 'passthrough').
-        """
-        try:
-            self.latest_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
-        except Exception as e:
-            self.get_logger().warning(f"Depth cv_bridge failed: {e}")
-
-
     def detect_target(self, xyxy: np.ndarray, conf: np.ndarray, cls_ids: np.ndarray, image_h: int, image_w: int,
                     target_class: str, threshold_score: float):
         """
@@ -279,25 +274,22 @@ class LimoYoloNode(Node):
             threshold_score (float): Soglia di confidenza minima.
         """
 
-        # Itera per ogni bounding box
         for i in range(len(xyxy)):
-
-
             x1, y1, x2, y2 = xyxy[i]
 
             # Estrae la confidenza per l'elemento corrente
             score = None    # TODO
 
             # Estrae la classe per l'elemento corrente
-            class_idx = None # TODO
-            cls_name = str(self.model_names.get(int(class_idx), "unknown")).lower()
+            cls_idx = None  # TODO
+            cls_name = str(self.model_names.get(int(cls_idx), "unknown")).lower()
 
             # Considera solo gli elementi appartenenti alla classe target
             # TODO
             
             # Considera l'elemento corrente solo se la soglia di confidenza è sufficientemente elevata
             # TODO
-
+            
             # Rilassa la soglia di confidenza se il bersaglio è stato già individuato (per stabilità)
             if self.target_detected and score < (threshold_score / 2):
                 continue
@@ -307,13 +299,19 @@ class LimoYoloNode(Node):
             self.target_last_seen_time = time.time()
 
             # Calcola il centro della bounding box
-            self.target_cx = None # TODO
-            self.target_cy = None # TODO
+            # TODO: salvare le coordinate del centro in (self.target_cx, self.target_cy)
 
 
-            self.target_detected = None # TODO
+            # Calcola larghezza e altezza del box in pixel
 
-            return  
+            self.target_box_ratio = None    # TODO
+
+            # Debug log per vedere quanto spazio occupa
+            self.get_logger().info(f"Target ratio: {self.target_box_ratio:.4f}")
+
+            self.target_detected = None     # TODO
+
+            return
 
     # Control loop
     def control_loop(self):
@@ -323,44 +321,91 @@ class LimoYoloNode(Node):
         Logica:
         1. Se il target è perso per più di 1 secondo, entra in modalità ricerca.
         2. Se il target non è rilevato, il robot ruota sul posto (cerca).
-        3. Se il target è rilevato E la profondità è disponibile:
-            a. Controlla la distanza di sicurezza (`safe_distance`).
-            b. Se troppo vicino, pubblica l'arresto e imposta `self.stopped = True`.
-        4. Altrimenti (target rilevato e distanza OK), il robot avanza.
+        3. Se il target è rilevato:
+            a. Allinea il robot con il target, in modo che il centro della bounding box corrisponda al 
+               centro dell'immagine della camera.
+            b. Controlla il rapporto tra area della bounding box e area dell'immagine.
+            c. Se troppo vicino, pubblica l'arresto e imposta `self.stopped = True`.
+        4. Altrimenti, il robot avanza.
         """
         now = time.time()
 
         if self.stopped:
             return
 
-        # Se è passato più di un secondo dall'ultima volta in cui il bersaglio è stato individuato, è considerato perso
+        # Se il bersaglio non è individuato da almeno un secondo, è considerato perso
         if True:    # TODO
-            self.target_detected = None     # TODO
-            self.latest_depth = None
+            self.target_detected = False
+            self.target_box_ratio = None
+            self.target_centered = False
 
         # Se il bersaglio non è stato individuato, ruota sul posto
+        if None:    # TODO
+            self.stopped = False
+
+            # TODO: ruotare
+
+            return
         
-        # TODO
+        # Altrimmenti, allinea il robot al centro della bounding box
+        if not self.target_centered:
+            error = None    # TODO
 
-        if self.latest_depth is not None and self.target_detected:
+            # Deadband: il target è stato centrato
+            if None:    # TODO: controlla se il target è stato centrato
+                
+                self.publish_stop()
 
-            # Estrae la profondità (in metri) nel centro del box target
-            dist = self.latest_depth[self.target_cy, self.target_cx]
+                self.get_logger().info(f"TARGET CENTERED")
 
-            # Se il robot è abbastanza vicino al target: stop (controllare anche se dist > 0.0 per evitare valori invalidi)
+                self.target_centered = True
 
-            # TODO
+                return
+
+            # Rotazione proporzionale
+            angular_z = self.center_turn_speed * error
+
+            # Calcola la velocità angolare
+            angular_z = max(min(angular_z, self.turn_speed_max),
+                            -self.turn_speed_max)
+
+            # Ruota
+            # TODO: usare angular_z
+
+            return
+
+        # Controlla se la bounding box è abbastanza grande -> il robot è abbastanza vicino
+        if self.target_box_ratio is not None:
+
+            # TODO: se il rapporto tra bounding box e area dell'immagine è abbastanza grande: 
+            # a. Pubblicare messaggio di stop per il robot
+            # b. Aggiornare la flag self.stopped
+            # c. Ritornare
+
+            pass    # TODO
 
 
+        # Altrimenti avanza
         self.stopped = False
         
-        # Altrimenti avanza
-        forward_speed = 0.4
-        # TODO
+        # TODO: avanza
 
     # ----------------------------------------------------
     # METODI DI SUPPORTO
     # ----------------------------------------------------
+    def compute_center_error(self):
+        """
+        Calcola l'errore orizzontale normalizzato rispetto al centro dell'immagine:
+        -1.0 = il target si trova all'estrema sinistra
+         0.0 = il target è perfettamente al centro
+        +1.0 = il target si trova all'estrema destra
+        
+        Ritorna:
+            float: Errore normalizzato nell'intervallo [-1.0, 1.0].
+        """
+        image_center_x = self.image_w / 2.0
+        return (self.target_cx - image_center_x) / image_center_x
+    
     def publish_twist(self, linear=0.0, angular=0.0):
         """
         Pubblica un comando di velocità lineare e angolare sul topic /cmd_vel.
