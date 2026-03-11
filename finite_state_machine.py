@@ -11,7 +11,7 @@ from rclpy.node import Node                                                     
 from sensor_msgs.msg import Image, LaserScan                                     # type: ignore
 from geometry_msgs.msg import Twist                                              # type: ignore
 from cv_bridge import CvBridge                                                   # type: ignore
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy         # type: ignore
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, qos_profile_sensor_data     # type: ignore
 
 try:
     from ultralytics import YOLO                                                 # type: ignore
@@ -26,10 +26,10 @@ class FiniteStateMachine(Node):
         # PARAMETRI ROS
         self.declare_parameter("image_topic", "/image")
         self.declare_parameter("model", "yolov8n.pt")
-        self.declare_parameter("score_thresh", 0.7)             # Soglia di confidenza minima da soddisfare
-        self.declare_parameter("filter_class", "sports ball")   # Classe target da individuare
+        self.declare_parameter("score_thresh", 0.8)             # Soglia di confidenza minima da soddisfare
+        self.declare_parameter("filter_class", "bottle")   # Classe target da individuare
         self.declare_parameter("turn_speed_max", 1.5)           # Velocità angolare massima
-        self.declare_parameter("bb_ratio_threshold", 0.03)      # Rapporto tra bounding box e immagine da usare come proxy di distanza
+        self.declare_parameter("bb_ratio_threshold", 0.1)      # Rapporto tra bounding box e immagine da usare come proxy di distanza
 
         self.img_topic = self.get_parameter("image_topic").value
         self.model_path = self.get_parameter("model").value
@@ -80,11 +80,13 @@ class FiniteStateMachine(Node):
 
         # RILEVAMENTO OSTACOLI
         self.ranges = []
-        self.direction = None
+        self.direction = -1     # Destra di default
 
         self.obstacle_detected = False
 
-        self.obstacle_threshold = 0.6   # Distanza di sicurezza a cui evitare un ostacolo
+        self.end_avoiding_time = None
+
+        self.obstacle_threshold = 0.2   # Distanza di sicurezza a cui evitare un ostacolo
         self.rejoin_distance = 0.8      # Distanza da percorrere in fase di evitamento ostacolo
         self.current_distance = np.inf  # Distanza corrente da eventuali ostacoli
 
@@ -94,14 +96,14 @@ class FiniteStateMachine(Node):
         # -----------------------------
         # ROS I/O
         # -----------------------------
-        qos = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10
-        )
+        # qos = QoSProfile(
+        #     reliability=QoSReliabilityPolicy.,
+        #     history=QoSHistoryPolicy.KEEP_LAST,
+        #     depth=10
+        # )
 
-        self.sub_image = self.create_subscription(Image, self.img_topic, self.on_image, 10)     # Riceve le immagini della camera
-        self.sub_scan = self.create_subscription(LaserScan, "/scan", self.on_scan, 10)          # Riceve il LIDAR
+        self.sub_image = self.create_subscription(Image, "/camera/color/decompressed", self.on_image, 10)     # Riceve le immagini della camera
+        self.sub_scan = self.create_subscription(LaserScan, "/scan", self.on_scan, qos_profile_sensor_data)          # Riceve il LIDAR
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)                             # Invia le velocità
         self.pub_image = self.create_publisher(Image, "/yolo/annotated_image", 10)              # Pubblica le immagini annotate con bounding box
 
@@ -237,29 +239,37 @@ class FiniteStateMachine(Node):
         self.ranges = np.array(msg.ranges)
         self.angle_min = msg.angle_min
         self.angle_increment = msg.angle_increment
-        self.angle_max = msg.angle_max
 
-        front_angle_width = math.radians(30)
+        # Pulisce i valori nan e inf
+        for i in range(len(self.ranges)):
+            if self.ranges[i] is math.inf or self.ranges[i] is math.nan:
+                self.ranges[i] = 5.0
 
-        i_min = self.angle_to_index(-front_angle_width)
-        i_max = self.angle_to_index(front_angle_width)
+        # Lista degli angoli
+        self.angles = [self.angle_min + i * self.angle_increment for i in range(len(self.ranges))]
 
-        # Clamp safely
-        i_min = max(i_min, 0)
-        i_max = min(i_max, len(self.ranges) - 1)
+        # Lista di indici
+        self.obstacle_indices = [idx for idx in range(len(self.ranges)) if self.ranges[idx] < self.obstacle_threshold and abs(self.angles[idx]) < math.pi/3.]
+        
+        if self.obstacle_indices:
+            self.min_angle = self.angles[min(self.obstacle_indices)]
+            self.max_angle = self.angles[max(self.obstacle_indices)]
+            
+            obstacle_values = [self.ranges[idx] for idx in self.obstacle_indices]
+            self.current_distance = min(obstacle_values)
 
-        front_ranges = self.ranges[i_min:i_max]
-        front_ranges = front_ranges[np.isfinite(front_ranges)]
-        front_ranges = front_ranges[front_ranges > 0.0]
-
-        if len(front_ranges) == 0:
-            self.current_distance = np.inf
         else:
-            self.current_distance = np.min(front_ranges)
+            self.current_distance = 10
+
 
     # -----------------------------
     # METODI DI CONTROLLO
     # -----------------------------
+    def normalize_angle(self, angle: float) -> float:
+        """
+        Normalizza un angolo all'intervallo [-pi, pi).
+        """
+        return (angle + math.pi) % (2 * math.pi) - math.pi
     def compute_center_error(self):
         """
         Calcola l'errore orizzontale normalizzato rispetto al centro dell'immagine:
@@ -334,8 +344,7 @@ class FiniteStateMachine(Node):
         frontale è inferiore alla soglia, A MENO CHE l'oggetto rilevato da YOLO
         sia proprio in quel punto.
         """
- 
-        # Rileva un ostacolo generico se la distanza LiDAR frontale è troppo piccola.
+        
         self.obstacle_detected = self.current_distance < self.obstacle_threshold
 
     # -----------------------------
@@ -423,6 +432,8 @@ class FiniteStateMachine(Node):
         # Controllo di sicurezza: se lo stato interno non è FORWARD -> ritorna subito
         if self.state != "FORWARD": 
             return
+        
+        print("Moving forward")
         
         # Salva il tempo di inizio ricerca in rettilineo
         if self.search_start_time is None:
@@ -534,46 +545,29 @@ class FiniteStateMachine(Node):
         return
 
     def avoid(self):
-        """
-        Gestisce la manovra di evitamento ostacoli basata sui dati LiDAR.
         
-        La logica si articola in tre fasi sequenziali:
-        1. EVITAMENTO (Rotazione): Se viene rilevato un ostacolo frontale, analizza i 
-           settori laterali del LiDAR (destra e sinistra) e ruota il robot verso la 
-           direzione che offre lo spazio libero maggiore.
-        2. MOVIMENTO LATERALE (Disimpegno): Una volta orientato verso una zona libera, 
-           il robot avanza in linea retta per una distanza predefinita (rejoin_distance) 
-           per superare l'ingombro dell'ostacolo.
-        3. RIALLINEAMENTO: Utilizza un controllo proporzionale per far ruotare il robot 
-           e riportarlo all'orientamento originale (starting_yaw) che aveva prima di 
-           incontrare l'ostacolo.
-           
-        Al completamento del riallineamento, il robot torna allo stato "FORWARD".
-        """
-
-        # EVITAMENTO (Ruota per liberare il fronte)
-        if self.obstacle_detected:
+        
+        if self.end_avoiding_time is None:
+            duration = (math.pi / 2) / self.angular_speed
+                
+            self.start_time = time.time()
+            self.end_avoiding_time = self.start_time + duration
             
-            if self.direction is None:
-                left_min_dist = self.get_sector_min_distance(
-                    math.radians(20),
-                    math.radians(55)
-                )
+            print(f"Obstacle! Performing 90° right turn. Duration: {duration:.2f}s")
 
-                right_min_dist = self.get_sector_min_distance(
-                    math.radians(-55),
-                    math.radians(-20)
-                )
+        current_time = time.time()
 
-                self.direction = 1 if left_min_dist > right_min_dist else -1
-            
-            # Ruota sul posto.
-            self.publish_twist(0.0, 0.2 * self.direction)
+        if current_time < self.end_avoiding_time:
+            # Continue rotating right
+            self.publish_twist(0.0, self.angular_speed * self.direction)
+
             return
-        
         else:
-            self.direction = None
-        
+            # Rotation complete: Reset state
+            print("Turn complete. Resuming...")
+            self.end_avoiding_time = None
+            self.publish_twist(0.0, 0.0)
+
         # Resetta le variabili di stato FORWARD
         self.search_start_time = None
 
